@@ -1,0 +1,22 @@
+# Core
+ollama>=0.4.0                    # local VLM engine (default) — needs the Ollama server + a vision model
+groq>=0.13.0                     # optional cloud VLM engine
+python-dotenv>=1.0.0
+streamlit>=1.40.0
+
+# Imaging
+pillow>=11.0.0
+numpy>=2.1.0
+opencv-python-headless>=4.10.0   # advanced preprocessing (deskew, adaptive threshold); Pillow fallback if unavailable
+pymupdf>=1.24.0                  # local PDF rasterization (Groq vision accepts images only)
+
+# Web backend (FastAPI + MongoDB)
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pymongo>=4.10.0
+PyJWT>=2.10.0
+python-multipart>=0.0.18
+email-validator>=2.2.0
+
+# Optional classical OCR baseline (also requires the Tesseract binary + fra/ara traineddata)
+# pytesseract>=0.3.13
