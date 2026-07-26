@@ -14,8 +14,11 @@ Two interchangeable VLM engines back the pipeline:
 - **Local VLM** *(default)* — Qwen3-VL served by [Ollama](https://ollama.com)
   on this machine's GPU. 100% offline: no API key, no cost, no document ever
   leaves the computer.
-- **Groq cloud** *(optional)* — Llama 4 vision via the Groq API, kept for
-  benchmarking local vs cloud quality/latency (requires `GROQ_API_KEY`).
+- **Groq cloud** *(optional)* — Llama 4 vision via the Groq API, for
+  benchmarking local vs cloud quality/latency (requires `GROQ_API_KEY`). Note:
+  Groq removed its Llama-4 vision models from general access in mid-2026, so
+  this engine may 404 until a vision-capable model is available again — the
+  local engine is the reliable default (see [limitations](#notes--known-limitations)).
 
 It ships two interfaces over the same OCR core:
 
@@ -64,7 +67,9 @@ One-off alternatives: `streamlit run app.py` (prototype UI) or
 - [Environment variables](#environment-variables)
 - [Streamlit prototype](#streamlit-prototype)
 - [CLI](#cli)
+- [Completeness QA (two-model comparison)](#completeness-qa-two-model-comparison)
 - [Evaluation (CER / WER)](#evaluation-cer--wer)
+- [Performance](#performance)
 - [Notes & known limitations](#notes--known-limitations)
 
 ## Architecture
@@ -108,9 +113,10 @@ FastAPI backend (:8000)  ── JWT auth, PBKDF2 password hashing
 
 1. **VLM vision** *(recommended, default)* — the preprocessed page is read
    directly by the vision-language model. PDFs are rasterized locally, one
-   JPEG image per page (~200 DPI via PyMuPDF) — pages are transcribed
-   individually and joined with a `---` separator. Best on degraded scans,
-   complex layouts, tables, and Arabic script.
+   JPEG image per page (300 DPI via PyMuPDF, see `OCR_PDF_DPI`) — pages are
+   transcribed individually and joined with a `---` separator. Best on degraded
+   scans, complex layouts, tables, and Arabic script. The prompt captures
+   document structure as Markdown and reports checkbox/tick-box states (☑/☐).
 2. **Hybrid** — Tesseract produces a fast raw transcription; the VLM then
    fixes character confusions, broken words, and accent/diacritic errors
    **without paraphrasing**. Requires Tesseract to be installed
@@ -135,6 +141,7 @@ OCR/
 │   ├── ocr_engine.py         optional Tesseract baseline (fra+eng+ara)
 │   ├── language.py           FR/EN/AR detection, RTL helpers
 │   ├── evaluation.py         CER / WER metrics (Levenshtein)
+│   ├── compare.py            two-model completeness QA (word-level diff)
 │   └── pipeline.py           end-to-end orchestration (the 3 modes above)
 │
 ├── backend/                 FastAPI REST API
@@ -329,7 +336,26 @@ python cli.py contrat.pdf -o contrat.txt
 python cli.py scan.jpg --engine groq             # cloud VLM instead
 python cli.py scan.jpg --mode hybrid --langs fr ar
 python cli.py scan.png --truth reference.txt     # prints CER / WER
+python cli.py contrat.pdf --compare --langs fr   # two-model completeness QA
 ```
+
+## Completeness QA (two-model comparison)
+
+No OCR engine — local or cloud — can *guarantee* it never drops a word on a
+scanned document; accuracy is always a measured rate, not an absolute. The
+honest way to push toward completeness is to read each page with **two
+independent models** and review wherever they disagree: agreement = high
+confidence, disagreement = a spot worth a human glance.
+
+`python cli.py <file> --compare` does exactly this, fully offline, using the
+two local models (`qwen3-vl:4b-instruct` vs `qwen3-vl:8b-instruct` — pull the
+8b once with `ollama pull qwen3-vl:8b-instruct`). It prints a word-level
+agreement percentage and every disagreement span, marking `·(missing)·` when
+one model skipped text the other caught. In practice the two models have
+*different* blind spots — the 4b is stronger on some checkboxes/fine print,
+the 8b catches some headers the 4b drops — so the diff reliably surfaces real
+omissions a single pass would hide. `src/compare.py` exposes the same as a
+library (`compare_image` / `compare_pdf`).
 
 ## Evaluation (CER / WER)
 
@@ -337,6 +363,32 @@ python cli.py scan.png --truth reference.txt     # prints CER / WER
 Unicode NFC normalization (required for consistent Arabic comparison). Use
 the Streamlit app's *Evaluate against ground truth* panel or `--truth` on the
 CLI to compare modes on your own corpus.
+
+## Performance
+
+Measured on a 6 GB NVIDIA laptop GPU (RTX 4050) with the default local engine
+(`qwen3-vl:4b-instruct`, 300 DPI, `OLLAMA_NUM_CTX=8192`):
+
+| Workload | Time |
+|---|---|
+| Printed page | ~25–29 s |
+| Dense handwritten page | ~32–47 s |
+| 3-page printed PDF | ~86 s (measured) |
+| 10-page form | ~5 min |
+| First page after Ollama is idle | **+ ~10 s** one-time (model loads into VRAM) |
+| `--compare` QA mode | ~2.5–3× (runs the 4b **and** 8b models) |
+
+Rule of thumb: **time ≈ pages × ~30 s**, plus a one-time ~10 s on the first
+scan after a reboot. Two knobs trade speed for completeness:
+
+- `OLLAMA_NUM_CTX` — the dominant lever. The default 8192 keeps the 4B model
+  fully GPU-resident; larger values spill layers to CPU and slow every page
+  ~3× for no accuracy gain on single pages.
+- `OCR_PDF_DPI` — lowering 300→250 gives ~20 s/page but can drop the finest
+  print; 300 is the default to prioritize completeness over speed.
+
+Pages are processed sequentially: on a single GPU that is the fast path
+(concurrent calls just contend for the same VRAM).
 
 ## Notes & known limitations
 
@@ -361,7 +413,10 @@ CLI to compare modes on your own corpus.
 - Groq's model catalog changes over time — check
   [console.groq.com/docs/models](https://console.groq.com/docs/models) for
   current vision-capable model IDs and override via `OCR_MODEL` in `.env` if
-  the default ever 404s.
+  the default ever 404s. **As of July 2026 Groq had removed all Llama-4 vision
+  models from general access**, so the cloud *vision* engine may be
+  unavailable; the local Ollama engine is the reliable default and the
+  `--compare` QA uses two local models, needing no cloud at all.
 - No user signup flow — accounts are seeded on backend startup or inserted
   directly into the `ey_ocr.users` MongoDB collection. Appropriate for an
   internal prototype, not for public deployment as-is.

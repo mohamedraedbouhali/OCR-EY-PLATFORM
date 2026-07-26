@@ -31,6 +31,14 @@ print, footnotes, headers/footers, page numbers, stamps, checkbox labels, and \
 form helper/placeholder text (e.g. "Choose an item.", "Please refer to the \
 guidance..."). Never skip text because it looks like boilerplate or form \
 furniture.
+- CHECKBOXES AND TICK-BOXES ARE CRITICAL: for every checkbox, radio button or \
+tick-box, output its state next to its label. Write ☑ before a box that is \
+ticked, crossed, filled or marked in ANY way (✓, ✗, X, a dot, a scribble), and \
+☐ before an empty box. This applies even when the boxes sit in a separate row \
+or grid from their labels — associate each mark with the option directly above, \
+below or beside it. Look carefully: marks are often faint handwritten strokes. \
+Example: "☐ Discriminatory  ☑ Domestic  ☐ Financial". Never output a form \
+option without its box state.
 - Preserve the reading order. For Arabic passages, transcribe right-to-left text \
 in correct logical order.
 - Preserve document structure using Markdown: headings, paragraphs, lists, and \
@@ -39,6 +47,25 @@ tables (as Markdown tables). Keep line breaks where they are semantically meanin
 - If a region is genuinely illegible, mark it as [illisible]/[illegible] rather \
 than guessing entire passages.
 - Output ONLY the transcription, no preamble."""
+
+_VERIFY_SYSTEM = """You are a meticulous OCR proofreader. You are given a scanned \
+page image and a DRAFT transcription of it. The draft may have MISSED some text \
+or transcribed it wrongly.
+
+Your job is to produce the COMPLETE, corrected transcription:
+- Scan the image region by region, top to bottom, left to right. For EACH piece \
+of visible text — printed or handwritten, including small print, footnotes, \
+headers/footers, page numbers, stamps, table cells and checkbox states (☑/☐) — \
+confirm it appears in the draft. If it is missing, ADD it in its correct place. \
+If it is wrong, FIX it.
+- Pay special attention to text the draft is likely to have skipped: faint or \
+small print, marginal notes, isolated numbers/dates, table cells, and \
+checkboxes.
+- Do NOT remove correct text, do NOT translate, summarize, reorder, or add \
+commentary. Preserve structure and reading order (Arabic right-to-left in \
+logical order).
+- Output ONLY the full corrected transcription, no preamble, no notes about \
+what you changed."""
 
 _CORRECTION_SYSTEM = """You are an OCR post-correction engine for documents in \
 French, English, and Arabic. You receive raw text produced by a classical OCR \
@@ -87,12 +114,36 @@ class VLMEngine(ABC):
     # ------------------------------------------------------------------ public API
 
     def extract_text(self, image_bytes: bytes, media_type: str = "image/jpeg",
-                     languages: list[str] | None = None) -> VLMResult:
-        """Vision-based transcription of a scanned page image."""
-        return self._generate(
+                     languages: list[str] | None = None,
+                     verify: bool = False) -> VLMResult:
+        """Vision-based transcription of a scanned page image.
+
+        When `verify` is True, a second pass re-reads the image against the
+        first transcription to recover missed/wrong text (higher recall, ~2x
+        the time). It cannot guarantee zero omissions — no OCR can — but it
+        measurably reduces them.
+        """
+        first = self._generate(
             _EXTRACTION_SYSTEM,
             "Transcribe this scanned document." + self._language_hint(languages),
             image=(image_bytes, media_type),
+        )
+        if not verify:
+            return first
+
+        second = self._generate(
+            _VERIFY_SYSTEM,
+            "Draft transcription to complete and correct:"
+            + self._language_hint(languages)
+            + "\n\n<draft>\n" + first.text + "\n</draft>",
+            image=(image_bytes, media_type),
+        )
+        return VLMResult(
+            text=second.text,
+            model=second.model,
+            input_tokens=first.input_tokens + second.input_tokens,
+            output_tokens=first.output_tokens + second.output_tokens,
+            stop_reason=second.stop_reason,
         )
 
     def extract_from_pdf(self, pdf_bytes: bytes,

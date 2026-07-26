@@ -36,10 +36,17 @@ def main() -> int:
                         help="language hint, e.g. --langs fr ar")
     parser.add_argument("--truth", type=Path,
                         help="ground-truth text file for CER/WER evaluation")
+    parser.add_argument("--compare", action="store_true",
+                        help="completeness QA: read the page with two local models "
+                             "(4b vs 8b) and flag every word they disagree on")
     args = parser.parse_args()
 
     if not args.input.exists():
         parser.error(f"file not found: {args.input}")
+
+    if args.compare:
+        return _run_compare(args)
+
     mode = Mode(args.mode)
     engine = Engine(args.engine)
     if mode != Mode.TESSERACT_ONLY:
@@ -75,6 +82,35 @@ def main() -> int:
         print(f"CER={s['cer']:.2%}  WER={s['wer']:.2%}  "
               f"char_acc={s['char_accuracy']}%  word_acc={s['word_accuracy']}%",
               file=sys.stderr)
+    return 0
+
+
+def _run_compare(args) -> int:
+    """Two-model completeness QA: diff 4b vs 8b, flag disagreements to review."""
+    from src import compare, local_vlm
+
+    for model in (compare.DEFAULT_MODEL_A, compare.DEFAULT_MODEL_B):
+        if not local_vlm.is_available(model):
+            parser_error = (f"model '{model}' not available — run: ollama pull {model}")
+            print(parser_error, file=sys.stderr)
+            return 1
+
+    data = args.input.read_bytes()
+    if args.input.suffix.lower() == ".pdf":
+        results = compare.compare_pdf(data, languages=args.langs)
+    else:
+        results = [compare.compare_image(data, languages=args.langs)]
+
+    total_dis = 0
+    for i, r in enumerate(results, 1):
+        if len(results) > 1:
+            print(f"\n===== PAGE {i}/{len(results)} =====")
+        print(compare.format_report(r))
+        total_dis += len(r.disagreements)
+
+    avg = sum(r.agreement for r in results) / len(results)
+    print(f"\n[overall: {len(results)} page(s) | mean agreement {avg*100:.1f}% "
+          f"| {total_dis} disagreement span(s) to review]", file=sys.stderr)
     return 0
 
 

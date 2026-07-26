@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { jsPDF } from "jspdf";
+import html2canvas from "html2canvas";
 import { runOCR, getDocument, meta } from "../api.js";
 import useHistoryList from "../hooks/useHistoryList.js";
 
@@ -229,14 +231,59 @@ export default function Dashboard({ user, navigate, notify }) {
       .then(() => notify("Copied to clipboard"));
   }
 
-  function downloadText() {
+  async function downloadPDF() {
     if (!result) return;
-    const blob = new Blob([result.text], { type: "text/plain;charset=utf-8" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `${result.filename.replace(/\.[^.]+$/, "")}_ocr.txt`;
-    a.click();
-    URL.revokeObjectURL(a.href);
+    const stem = result.filename.replace(/\.[^.]+$/, "");
+    const isRtl = isArabicHeavy(result.text);
+    const esc = (s) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const langs =
+      (result.languages || []).map((l) => l.toUpperCase()).join(" · ") || "—";
+    const engine = ENGINE_LABELS[result.engine] || result.engine || "";
+    const date = new Date().toLocaleDateString();
+
+    // Render an A4-width node the browser paints (Arabic shaped + RTL correct),
+    // snapshot it with html2canvas, and emit a real .pdf file via jsPDF — a
+    // direct download, no print dialog. Fully offline (both libs are bundled).
+    const el = document.createElement("div");
+    el.style.cssText =
+      "position:fixed;left:-99999px;top:0;width:794px;padding:48px;" +
+      "background:#fff;color:#111;font-family:'Segoe UI',Arial,sans-serif;";
+    el.innerHTML = `
+      <div style="border-bottom:3px solid #FFE600;padding-bottom:10px;margin-bottom:18px;">
+        <span style="font-weight:900;background:#2E2E38;color:#FFE600;padding:2px 8px;font-size:15px;">EY</span>
+        <span style="font-size:15px;"> Intelligent OCR</span>
+        <div style="font-size:18px;font-weight:700;margin:8px 0 2px;">${esc(stem)}</div>
+        <div style="font-size:11px;color:#666;">${esc(engine)} · ${esc(langs)} · ${esc(date)}</div>
+      </div>
+      <pre style="white-space:pre-wrap;word-wrap:break-word;font-family:inherit;font-size:13px;line-height:1.55;margin:0;${
+        isRtl ? "direction:rtl;text-align:right;" : ""
+      }">${esc(result.text)}</pre>`;
+    document.body.appendChild(el);
+    try {
+      const canvas = await html2canvas(el, { scale: 2, backgroundColor: "#ffffff" });
+      const pdf = new jsPDF({ unit: "pt", format: "a4" });
+      const pageW = pdf.internal.pageSize.getWidth();
+      const pageH = pdf.internal.pageSize.getHeight();
+      const imgH = (canvas.height * pageW) / canvas.width;
+      const imgData = canvas.toDataURL("image/jpeg", 0.92);
+      let pos = 0;
+      let left = imgH;
+      pdf.addImage(imgData, "JPEG", 0, pos, pageW, imgH);
+      left -= pageH;
+      while (left > 0) {
+        pos -= pageH;
+        pdf.addPage();
+        pdf.addImage(imgData, "JPEG", 0, pos, pageW, imgH);
+        left -= pageH;
+      }
+      pdf.save(`${stem}_ocr.pdf`);
+      notify("PDF downloaded");
+    } catch (err) {
+      setError("PDF export failed: " + err.message);
+    } finally {
+      el.remove();
+    }
   }
 
   const rtl = result && isArabicHeavy(result.text);
@@ -452,56 +499,13 @@ export default function Dashboard({ user, navigate, notify }) {
                     <button className="btn-ghost" onClick={copyText}>
                       Copy
                     </button>
-                    <button className="btn-primary" onClick={downloadText}>
-                      Download .txt
+                    <button className="btn-primary" onClick={downloadPDF}>
+                      Download PDF
                     </button>
                   </div>
                 </div>
 
-                <div className="metric-row">
-                  <div className="metric">
-                    <span className="metric-label">Mode</span>
-                    <span className="metric-value">
-                      {MODE_LABELS[result.mode] || result.mode}
-                    </span>
-                  </div>
-                  {result.engine && (
-                    <div className="metric">
-                      <span className="metric-label">Engine</span>
-                      <span className="metric-value">
-                        {ENGINE_LABELS[result.engine] || result.engine}
-                      </span>
-                    </div>
-                  )}
-                  <div className="metric">
-                    <span className="metric-label">Languages</span>
-                    <span className="metric-value">
-                      {result.languages.length
-                        ? result.languages.map((l) => l.toUpperCase()).join(" · ")
-                        : "—"}
-                    </span>
-                  </div>
-                  <div className="metric">
-                    <span className="metric-label">Duration</span>
-                    <span className="metric-value">
-                      {result.duration_s.toFixed(1)}s
-                    </span>
-                  </div>
-                  <div className="metric">
-                    <span className="metric-label">Tokens</span>
-                    <span className="metric-value">
-                      {(result.input_tokens + result.output_tokens).toLocaleString()}
-                    </span>
-                  </div>
-                  {result.tesseract_confidence != null && (
-                    <div className="metric">
-                      <span className="metric-label">Tess. conf.</span>
-                      <span className="metric-value">
-                        {result.tesseract_confidence.toFixed(0)}%
-                      </span>
-                    </div>
-                  )}
-                </div>
+                {/* metrics row hidden per request */}
 
                 <pre className={`ocr-text reveal ${rtl ? "rtl" : ""}`}>
                   {result.text}
