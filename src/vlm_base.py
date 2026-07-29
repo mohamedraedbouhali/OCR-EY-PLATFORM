@@ -46,6 +46,14 @@ tables (as Markdown tables). Keep line breaks where they are semantically meanin
 - Do NOT translate, summarize, correct grammar, or add commentary.
 - If a region is genuinely illegible, mark it as [illisible]/[illegible] rather \
 than guessing entire passages.
+- OCCLUSION — NEVER INVENT COVERED CHARACTERS: scanned forms often carry a \
+watermark, stamp or signature printed ACROSS the text (e.g. a large diagonal \
+"EXAMPLE"). Where such an overlay hides part of a value, transcribe the \
+characters you can actually see and write [?] for EACH character you cannot, \
+e.g. "01642 0[?]5070", "TS25 2[?]Q", "Ha[?]bour". Do NOT fill the gap with a \
+plausible digit or letter — a guessed phone number or postcode is worse than a \
+visibly incomplete one. This applies to single characters inside an otherwise \
+readable value, not just to whole illegible regions.
 - Output ONLY the transcription, no preamble."""
 
 _VERIFY_SYSTEM = """You are a meticulous OCR proofreader. You are given a scanned \
@@ -147,8 +155,12 @@ class VLMEngine(ABC):
         )
 
     def extract_from_pdf(self, pdf_bytes: bytes,
-                         languages: list[str] | None = None) -> VLMResult:
-        """Transcription of a scanned PDF, rasterized locally and read page by page."""
+                         languages: list[str] | None = None,
+                         verify: bool = False) -> VLMResult:
+        """Transcription of a scanned PDF, rasterized locally and read page by page.
+
+        `verify` runs the second recall pass on every page (see extract_text).
+        """
         import fitz  # PyMuPDF — imported lazily, only needed for PDF input
 
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -163,7 +175,7 @@ class VLMEngine(ABC):
                 Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB").save(
                     buf, format="JPEG", quality=88)
                 result = self.extract_text(buf.getvalue(), "image/jpeg",
-                                           languages=languages)
+                                           languages=languages, verify=verify)
                 page_texts.append(result.text)
                 total_in += result.input_tokens
                 total_out += result.output_tokens

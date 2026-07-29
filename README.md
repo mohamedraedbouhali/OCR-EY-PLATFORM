@@ -68,6 +68,9 @@ One-off alternatives: `streamlit run app.py` (prototype UI) or
 - [Streamlit prototype](#streamlit-prototype)
 - [CLI](#cli)
 - [Completeness QA (two-model comparison)](#completeness-qa-two-model-comparison)
+- [Recall verification (`--verify`)](#recall-verification---verify)
+- [Format validation (`--check`)](#format-validation---check)
+- [Applying corrections (`--fix`)](#applying-corrections---fix)
 - [Evaluation (CER / WER)](#evaluation-cer--wer)
 - [Performance](#performance)
 - [Notes & known limitations](#notes--known-limitations)
@@ -83,9 +86,11 @@ One-off alternatives: `streamlit run app.py` (prototype UI) or
                  │  adaptive binarization*    B) Hybrid: Tesseract        │
                  │                               + VLM correction         │
                  │  3. POST-PROCESSING        C) Tesseract baseline       │
-                 │  language detection                                    │
-                 │  RTL handling · Markdown   4. EVALUATION               │
+                 │  language detection        + optional --verify pass    │
+                 │  RTL handling · Markdown                               │
+                 │                            4. QUALITY CONTROL          │
                  │                            CER / WER vs ground truth   │
+                 │                            format validation (no truth)│
                  └────────────────────────────────────────────────────────┘
                               * applied for the Tesseract path only
 ```
@@ -142,6 +147,7 @@ OCR/
 │   ├── language.py           FR/EN/AR detection, RTL helpers
 │   ├── evaluation.py         CER / WER metrics (Levenshtein)
 │   ├── compare.py            two-model completeness QA (word-level diff)
+│   ├── validators.py         format checks for postcodes/phones/emails
 │   └── pipeline.py           end-to-end orchestration (the 3 modes above)
 │
 ├── backend/                 FastAPI REST API
@@ -337,7 +343,16 @@ python cli.py scan.jpg --engine groq             # cloud VLM instead
 python cli.py scan.jpg --mode hybrid --langs fr ar
 python cli.py scan.png --truth reference.txt     # prints CER / WER
 python cli.py contrat.pdf --compare --langs fr   # two-model completeness QA
+python cli.py form.pdf --verify                  # second recall pass (~2x slower)
+python cli.py form.pdf --check                   # postcode/phone/email format check
+python cli.py form.pdf --fix                     # apply the unambiguous corrections
+python cli.py form.pdf --verify --fix            # both
 ```
+
+`--verify`, `--check` and `--fix` are currently **CLI-only** — the web platform
+and the Streamlit prototype always run the single-pass extraction. The
+underlying `verify` flag is already plumbed through `OCRPipeline.run_image` /
+`run_pdf`, so exposing it in the other interfaces is a one-line change.
 
 ## Completeness QA (two-model comparison)
 
@@ -356,6 +371,127 @@ one model skipped text the other caught. In practice the two models have
 the 8b catches some headers the 4b drops — so the diff reliably surfaces real
 omissions a single pass would hide. `src/compare.py` exposes the same as a
 library (`compare_image` / `compare_pdf`).
+
+## Recall verification (`--verify`)
+
+The dominant failure mode of a vision model on a dense form is **omission**,
+not hallucination: faint print, marginal notes, table cells and checkboxes get
+silently skipped. A second read of the same page rarely helps on its own — the
+model tends to skip the same things twice.
+
+`--verify` instead runs a two-pass loop (`src/vlm_base.py`, `extract_text`):
+
+1. **Pass 1** — normal transcription with the extraction prompt.
+2. **Pass 2** — the model receives *the same image plus its own draft* wrapped
+   in `<draft>` tags, under a prompt whose only job is to find what the draft
+   missed and fix what it got wrong, while being forbidden to remove correct
+   text, translate, reorder or summarize.
+
+Giving the model its own output as a checklist turns an open-ended
+transcription task into a targeted search, which is what recovers the skipped
+spans. On PDFs the pass runs per page.
+
+**Cost: exactly 2× the model calls** — so ~2× the time and ~2× the tokens, and
+on a PDF that is per page.
+
+**Measured, honestly.** On a 10-page handwritten safeguarding form (7.6 min
+single-pass, 7.6 → 12.7 min with `--verify`) the second pass corrected one
+occluded phone number that the first pass had guessed wrong, but it did **not**
+recover a known dropped clause — a line of handwriting the first pass had
+skipped was still missing after verification. The pass is worth running on
+documents where completeness matters, but treat it as reducing the omission
+rate, not closing it. `--compare` and a human reviewer remain the backstops.
+
+## Format validation (`--check`)
+
+Digits and proper nouns are where a vision model fails first: they carry no
+linguistic context to fall back on, so a misread `B` → `8` produces something
+that looks perfectly plausible. On a form, those are exactly the fields that
+matter — a wrong postcode or phone number is worse than a wrong adjective.
+
+Those fields are *format-constrained*, so a chunk of that error class is
+catchable **with no ground truth at all**. `src/validators.py` runs three
+checks over the transcription:
+
+| Check | What it catches | Example |
+|---|---|---|
+| **Structural** | token violates the field's grammar | `TS25 28Q` — a UK postcode cannot hold a digit in its final two positions |
+| **Consistency** | the same entity transcribed two ways | `TS25 2SQ` in section 1 vs `TS2S 2SQ` in section 2 — both legal, so one is misread |
+| **Plausibility** | wrong length | a 9- or 10-digit UK phone number means a dropped digit |
+| **Term drift** | one proper noun spelled two ways | `Harlepool` against `Hartlepool` elsewhere in the same document |
+
+The term check counts occurrences **case-insensitively as substrings**, so
+email domains vote. That detail decides real cases: on the test form both
+spellings appeared 3× as words, and only `hartlepool.gov.uk` broke the tie 6–3.
+A pair where the shorter term is a prefix of the longer is skipped as
+inflection — otherwise `Concerns` "corrects" to `Concern` and the check
+corrupts text that was right.
+
+When exactly **one** OCR confusion substitution repairs a malformed token
+(`8`→`B`, `5`→`S`, `2`→`Z`…), the fix is unambiguous and is printed as a
+suggestion. Ambiguous repairs are reported without one.
+
+```
+Format validation: 2 error(s), 1 warning(s)
+------------------------------------------------------------------------
+  [ERROR  ] postcode: TS25 28Q
+            not a valid UK postcode — the final two characters must be letters (excluding C, I, K, M, O, V)
+            -> did you mean: TS25 2BQ
+  [ERROR  ] phone: 01642 4536
+            UK numbers have 11 digits; this has 9 — a character was dropped or invented
+  [WARNING] postcode: TS252BQ / TS252SQ
+            these postcodes differ by only 1-2 characters — likely one address misread two different ways; check against the page
+```
+
+Note the third finding: the repaired `TS25 2BQ` and a `TS25 2SQ` read elsewhere
+in the document are both structurally valid, but they cannot both be right —
+the consistency check surfaces that where the structural check alone would not.
+
+**What this cannot do:** it validates *form, not truth*. `01422 065770` is a
+perfectly well-formed UK number that happens to be Halifax rather than the
+Teesside `01642` the document actually says — no format rule catches that.
+Only a lookup against known-good values would, and that is document-specific.
+Treat a clean report as "no detectable format errors", never as "no errors".
+
+The rules are UK-specific (postcode grammar, `0[12378]` phone prefixes) because
+that is what the test corpus contains; other locales need their own patterns.
+
+## Applying corrections (`--fix`)
+
+`--check` reports; `--fix` acts. It applies **only** the findings that carry a
+suggestion — the ones where exactly one candidate satisfied the field's
+grammar, so there is nothing to choose between. Everything else (occlusion,
+disagreeing siblings, well-formed but wrong values) is left alone and reported
+for a human.
+
+Corrections are applied *before* the text is written, so `-o` output and any
+`--truth` CER/WER reflect what you actually receive. `--fix` implies `--check`.
+
+```
+[fixed] postcode: TS25 28Q  -> TS25 2BQ
+[fixed] postcode: TS19 28Q  -> TS19 2BQ
+[fixed] term:     Harlepool -> Hartlepool
+```
+
+Measured on the 10-page form: 4 structural errors → **0 errors, 3 warnings**,
+with no correct text altered. The three remaining warnings were genuine
+human-review items, not false alarms.
+
+`src/validators.py` exposes the same as a library:
+
+```python
+from src.validators import validate, apply_fixes, format_report
+
+findings      = validate(text)          # report only
+fixed, applied = apply_fixes(text)      # returns corrected text + what changed
+```
+
+**Auto-correction is a deliberate risk.** A wrong auto-fix is worse than no
+fix, because it is invisible. The suggestion rule is therefore strict — one
+surviving candidate, or nothing — and every applied change is printed to
+stderr so it can be audited. Both false-positive classes found so far
+(`CALL 101` read as a postcode, `Concerns` "corrected" to `Concern`) surfaced
+only by running against real 10-page output, not synthetic test strings.
 
 ## Evaluation (CER / WER)
 
@@ -376,7 +512,9 @@ Measured on a 6 GB NVIDIA laptop GPU (RTX 4050) with the default local engine
 | 3-page printed PDF | ~86 s (measured) |
 | 10-page form | ~5 min |
 | First page after Ollama is idle | **+ ~10 s** one-time (model loads into VRAM) |
+| `--verify` recall pass | ~2× (two model calls per page) |
 | `--compare` QA mode | ~2.5–3× (runs the 4b **and** 8b models) |
+| `--check` / `--fix` | negligible (pure regex, no model call) |
 
 Rule of thumb: **time ≈ pages × ~30 s**, plus a one-time ~10 s on the first
 scan after a reboot. Two knobs trade speed for completeness:
@@ -407,6 +545,30 @@ Pages are processed sequentially: on a single GPU that is the fast path
   dependency) and read one page at a time, at 300 DPI by default — fine print
   (form placeholders, footnotes) needs that resolution to be read reliably;
   lower `OCR_PDF_DPI` to 200 to trade small-print recall for speed.
+- No OCR engine can guarantee a complete transcription; three independent
+  tools address that from different angles — `--verify` (two-pass recall),
+  `--compare` (two-model disagreement), and `--check` (format validation).
+  None replaces a human review of a critical document.
+- `--check` validates **form, not truth**: a well-formed but wrong value (a
+  valid postcode for the wrong town) passes clean. Its rules are UK-specific
+  and would need extending for other locales.
+- **Occluded characters are guessed, not flagged.** Where a watermark or stamp
+  is printed across a value, the local 4b model fills the gap with a plausible
+  digit rather than marking it unreadable — so a phone number can come back
+  confident and wrong. The extraction prompt asks for `[?]` per hidden
+  character; the 4b model does not comply (measured: zero markers emitted on a
+  form whose watermark crosses six phone numbers). The instruction is kept for
+  larger models, but **do not rely on it** — `--check` catches the resulting
+  wrong-length numbers, which is currently the real defence.
+- Grading OCR output by asking a chatbot "does this match the PDF?" does not
+  work: the judge has to re-read the document to answer, and reports its own
+  misreads as your errors. Hand-write a `truth.txt` for one page and use
+  `--truth` instead.
+- The **Hybrid** and **Tesseract only** modes require the Tesseract binary plus
+  `pip install pytesseract` (commented out in `requirements.txt` by default).
+  Without it both modes are hidden from the web UI and the Streamlit sidebar,
+  and only **VLM vision** is offered — this is the normal configuration. They
+  are kept for benchmarking the GenAI approach against a classical one.
 - Images are automatically resized to the model's optimal resolution
   (≤ 2576 px long edge) and sent as JPEG to stay under Groq's payload limits;
   tiny scans are upscaled before recognition.

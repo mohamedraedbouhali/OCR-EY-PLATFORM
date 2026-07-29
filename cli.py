@@ -6,6 +6,7 @@ Examples:
     python cli.py scan.jpg --engine groq              # cloud VLM instead
     python cli.py scan.jpg --mode hybrid --langs fr ar
     python cli.py scan.png --truth reference.txt      # prints CER/WER
+    python cli.py form.pdf --verify --check           # recall pass + format checks
 """
 
 import argparse
@@ -36,6 +37,15 @@ def main() -> int:
                         help="language hint, e.g. --langs fr ar")
     parser.add_argument("--truth", type=Path,
                         help="ground-truth text file for CER/WER evaluation")
+    parser.add_argument("--verify", action="store_true",
+                        help="second recall pass: re-read the page against the "
+                             "draft to recover missed text (~2x slower)")
+    parser.add_argument("--check", action="store_true",
+                        help="validate postcodes, phone numbers and emails for "
+                             "format errors (no ground truth needed)")
+    parser.add_argument("--fix", action="store_true",
+                        help="apply the unambiguous corrections found by --check "
+                             "(implies --check)")
     parser.add_argument("--compare", action="store_true",
                         help="completeness QA: read the page with two local models "
                              "(4b vs 8b) and flag every word they disagree on")
@@ -61,15 +71,26 @@ def main() -> int:
     pipeline = OCRPipeline()
     data = args.input.read_bytes()
     if args.input.suffix.lower() == ".pdf":
-        result = pipeline.run_pdf(data, language_hint=args.langs, engine=engine)
+        result = pipeline.run_pdf(data, language_hint=args.langs, engine=engine,
+                                  verify=args.verify)
     else:
         result = pipeline.run_image(data, mode=mode, language_hint=args.langs,
-                                    engine=engine)
+                                    engine=engine, verify=args.verify)
 
     print(f"[mode={result.mode.value} | engine={result.engine or '-'} "
           f"| langs={','.join(result.languages) or '?'} "
           f"| {result.duration_s}s | preprocessing: {'; '.join(result.preprocessing_steps)}]",
           file=sys.stderr)
+
+    # Corrections are applied before the text is written, so the saved file and
+    # any CER/WER measured below reflect what the user actually receives.
+    if args.fix:
+        from src.validators import apply_fixes
+        result.final_text, applied = apply_fixes(result.final_text)
+        for f in applied:
+            print(f"[fixed] {f.field}: {f.value} -> {f.suggestion}", file=sys.stderr)
+        if not applied:
+            print("[fixed] nothing unambiguous to correct", file=sys.stderr)
 
     if args.output:
         args.output.write_text(result.final_text, encoding="utf-8")
@@ -82,6 +103,10 @@ def main() -> int:
         print(f"CER={s['cer']:.2%}  WER={s['wer']:.2%}  "
               f"char_acc={s['char_accuracy']}%  word_acc={s['word_accuracy']}%",
               file=sys.stderr)
+
+    if args.check or args.fix:
+        from src.validators import format_report, validate
+        print("\n" + format_report(validate(result.final_text)), file=sys.stderr)
     return 0
 
 

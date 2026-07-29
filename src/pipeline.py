@@ -58,7 +58,8 @@ class OCRPipeline:
 
     def run_image(self, image_bytes: bytes, mode: Mode = Mode.GENAI_VISION,
                   language_hint: list[str] | None = None,
-                  engine: Engine | str | None = None) -> PipelineResult:
+                  engine: Engine | str | None = None,
+                  verify: bool = False) -> PipelineResult:
         start = time.perf_counter()
 
         needs_binarization = mode in (Mode.HYBRID, Mode.TESSERACT_ONLY)
@@ -68,7 +69,8 @@ class OCRPipeline:
 
         if mode == Mode.GENAI_VISION:
             gen = self.engine(engine).extract_text(pre.to_jpeg_bytes(), "image/jpeg",
-                                                   languages=language_hint)
+                                                   languages=language_hint,
+                                                   verify=verify)
             result.final_text = gen.text
             result.engine = (Engine(engine) if engine else Engine(DEFAULT_ENGINE)).value
             result.model = gen.model
@@ -93,15 +95,20 @@ class OCRPipeline:
 
     def run_pdf(self, pdf_bytes: bytes,
                 language_hint: list[str] | None = None,
-                engine: Engine | str | None = None) -> PipelineResult:
+                engine: Engine | str | None = None,
+                verify: bool = False) -> PipelineResult:
         """Each page is rasterized locally and read by the vision model."""
         start = time.perf_counter()
-        gen = self.engine(engine).extract_from_pdf(pdf_bytes, languages=language_hint)
+        gen = self.engine(engine).extract_from_pdf(pdf_bytes, languages=language_hint,
+                                                   verify=verify)
+        steps = ["PDF rasterized locally, page by page"]
+        if verify:
+            steps.append("second-pass recall verification per page")
         return PipelineResult(
             mode=Mode.GENAI_VISION,
             final_text=gen.text,
             languages=language_hint or detect_languages(gen.text),
-            preprocessing_steps=["PDF rasterized locally, page by page"],
+            preprocessing_steps=steps,
             engine=(Engine(engine) if engine else Engine(DEFAULT_ENGINE)).value,
             model=gen.model,
             input_tokens=gen.input_tokens,
