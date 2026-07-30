@@ -1,0 +1,221 @@
+% Two-page summary of technical_note_ocr_en.tex
+% Build:  pdflatex summerize.tex
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[english]{babel}
+\usepackage[a4paper,top=1.8cm,bottom=1.8cm,left=2cm,right=2cm]{geometry}
+\usepackage{graphicx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{titlesec}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+% booktabs-style rules, defined locally (booktabs is not in every MiKTeX setup)
+\newcommand{\toprule}{\noalign{\hrule height 0.9pt}\noalign{\vskip 2.5pt}}
+\newcommand{\midrule}{\noalign{\vskip 2.5pt}\noalign{\hrule height 0.4pt}\noalign{\vskip 2.5pt}}
+\newcommand{\bottomrule}{\noalign{\vskip 2.5pt}\noalign{\hrule height 0.9pt}}
+
+\titlespacing*{\section}{0pt}{7pt}{3pt}
+\setlist[itemize]{itemsep=1pt,topsep=2pt,parsep=0pt,leftmargin=*}
+\setlength{\parskip}{2pt}
+\pagestyle{empty}
+
+\begin{document}
+
+% ------------------------------------------------------------------ header
+\noindent
+\begin{minipage}[c]{0.12\textwidth}
+\includegraphics[width=1.6cm]{../ey.png}
+\end{minipage}%
+\begin{minipage}[c]{0.88\textwidth}
+{\large\bfseries Intelligent OCR for Scanned Documents --- French / English / Arabic}\\[2pt]
+{\small Summary of the technical note: rationale for the OCR engine selection --- July 2026}
+\end{minipage}
+
+\vspace{4pt}
+\noindent\rule{\textwidth}{0.9pt}
+
+% ------------------------------------------------------------------ 1
+\section*{1. Problem}
+
+Scanned administrative forms, reports and handwritten material must be
+transcribed in \textbf{French, English and Arabic}, including mixed and
+right-to-left content. Classical OCR (Tesseract) detects \emph{character
+shapes} with no understanding of context, layout or language, and degrades
+sharply on noisy scans, mixed scripts, tables and handwriting --- precisely the
+cases at hand. A \textbf{Vision-Language Model} reads the image and produces
+text within a single network, and that joint understanding is what makes
+difficult documents tractable.
+
+Three constraints shaped every decision: the reference test document is a
+\textbf{strictly confidential} safeguarding form containing names and medical
+details, so no document may leave the machine; the target hardware is a laptop
+with an \textbf{NVIDIA RTX 4050 (6\,GB VRAM)}; and the solution must incur
+\textbf{no recurring cost}.
+
+% ------------------------------------------------------------------ 2
+\section*{2. Solution}
+
+A \textbf{local-first} chain: ingestion (PDFs rasterised locally, one image per
+page) $\rightarrow$ preprocessing $\rightarrow$ VLM inference $\rightarrow$
+Markdown structuring and language detection $\rightarrow$ optional quality
+control $\rightarrow$ delivery. Preprocessing runs on \textbf{OpenCV}
+(grayscale, non-local-means denoising, deskew, CLAHE contrast); binarisation is
+applied only on the Tesseract path, since the vision model reads
+contrast-enhanced grayscale better. PDFs are rasterised with \textbf{PyMuPDF}
+at 300\,DPI --- the resolution at which fine print stays legible --- and read
+page by page.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{@{}L{2.9cm}L{5.4cm}L{7.6cm}@{}}
+\toprule
+\textbf{Role} & \textbf{Model} & \textbf{Where it runs} \\
+\midrule
+Default engine & Qwen3-VL 4B instruct & Local, via Ollama, resident on the GPU \\
+Second opinion (QA) & Qwen3-VL 8B instruct & Local, via Ollama \\
+Classical baseline & Tesseract (\texttt{fra+eng+ara}) & Local, optional --- benchmarking and hybrid mode \\
+Optional cloud & Llama 4 Scout (vision) & Groq API \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All four sit behind one abstraction, so engines can be swapped without touching
+the processing chain. Three recognition modes run over it: \textbf{VLM vision}
+(default), \textbf{hybrid} (Tesseract + VLM correction) and \textbf{Tesseract
+only} (baseline).
+
+% ------------------------------------------------------------------ 3
+\section*{3. Key technical decisions}
+
+\begin{itemize}
+  \item \textbf{A VLM rather than classical OCR.} Classical OCR recognises
+        glyphs; a VLM understands the page --- context, layout and language.
+        Tesseract is kept as an optional baseline so the claim is measured, not
+        asserted.
+  \item \textbf{Qwen3-VL.} Strong multilingual performance including Arabic,
+        built for document tasks (dense text, tables, structured forms,
+        Markdown output), open weights, no licence fee.
+  \item \textbf{4B rather than 8B --- measured, not assumed.} On the reference
+        handwritten form the 4B scored \textbf{10/10 in 59\,s} against
+        \textbf{9/10 in 135\,s} for the 8B: at 3.3\,GB it stays fully resident
+        in 6\,GB of VRAM, while the 8B spills to the CPU. The smaller model is
+        both faster and more complete on this hardware.
+  \item \textbf{The \texttt{-instruct} tag is mandatory.} The base
+        \texttt{qwen3-vl} tags run in \emph{thinking} mode: they spend the whole
+        token budget on internal reasoning and return an empty transcription.
+  \item \textbf{Context window at 8192 tripled the speed.} Each page is a
+        separate call, so the window only needs to hold one page. Raising it
+        further wastes VRAM on the KV cache and forces model layers onto the
+        CPU --- about three times slower, for no accuracy gain.
+  \item \textbf{Local (Ollama) as the default.} No document leaves the machine,
+        no per-page fee, no rate limit, no internet needed --- and fast enough
+        on real hardware.
+\end{itemize}
+
+% ------------------------------------------------------------------ 4
+\section*{4. Quality control}
+
+On a dense form the dominant failure mode is \textbf{omission}, not
+hallucination: faint print, marginal notes, table cells and checkboxes get
+silently dropped, and simply reading the page twice does not help --- the model
+skips the same things twice. Three independent tools address this from
+different angles, alongside CER/WER measurement where a ground truth exists.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{@{}L{3.4cm}L{9.2cm}L{3.1cm}@{}}
+\toprule
+\textbf{Tool} & \textbf{Principle} & \textbf{Cost} \\
+\midrule
+Recall verification &
+  A second pass receives the same image \emph{plus its own draft}, under a
+  prompt whose only job is to find what the draft missed. Handing the model its
+  own output as a checklist turns open-ended transcription into a targeted
+  search. & 2$\times$ model calls \\
+Two-model comparison &
+  The page is read by two independent models and every disagreement is flagged.
+  The 4B and 8B have \emph{different} blind spots, so the diff surfaces real
+  omissions a single pass would hide. Fully offline. & 2.5--3$\times$ \\
+Format validation &
+  Postcodes, phone numbers and emails are format-constrained, so a share of
+  errors is catchable \textbf{with no ground truth at all}: structural,
+  consistency and length checks, with an unambiguous repair suggested when a
+  single OCR confusion substitution fixes the token. & negligible \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Format validation checks \textbf{form, not truth}: a well-formed but wrong value
+passes clean. A clean report means ``no detectable format errors'', never ``no
+errors''.
+
+% ------------------------------------------------------------------ 5
+\section*{5. Delivery and performance}
+
+The OCR core is interface-agnostic. The primary deliverable is a
+\textbf{full-stack web platform} --- React (Vite) single-page application,
+FastAPI backend with JWT authentication and PBKDF2 password hashing, MongoDB
+for a permanent searchable per-user document history --- backed by a Streamlit
+prototype and a command-line interface that additionally exposes the three
+quality tools above.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{@{}L{5.6cm}L{4.4cm}L{5.6cm}@{}}
+\toprule
+\textbf{Workload} & \textbf{Time} & \textbf{Notes} \\
+\midrule
+Printed page & 25--29\,s & RTX 4050, 300\,DPI, \texttt{num\_ctx} = 8192 \\
+Dense handwritten page & 32--47\,s & \\
+Three-page printed PDF & 86\,s & measured \\
+Ten-page form & about 5 minutes & \\
+First page after idle & +10\,s, one-time & model loads into VRAM \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Rule of thumb: \textbf{time $\approx$ pages $\times$ 30\,s}. Two parameters
+trade speed against completeness --- the context window and the PDF
+rasterisation resolution --- and both defaults deliberately favour
+completeness.
+
+% ------------------------------------------------------------------ 6
+\section*{6. Known limitations}
+
+\begin{itemize}
+  \item Performance is tied to the presence of a GPU and its VRAM; without one,
+        processing times become prohibitive.
+  \item The figures come from one reference document on one machine: they
+        indicate a trend, not a universal guarantee.
+  \item Fidelity is not guaranteed at 100\%. Given personal and medical data,
+        \textbf{human proofreading remains necessary} --- none of the three
+        quality tools replaces it.
+  \item Arabic handwriting remains the hardest case and accounts for most of the
+        residual errors.
+  \item The cloud path depends on a provider's model catalogue, which changes
+        over time; the model identifier is therefore configurable.
+  \item The format-validation rules are UK-specific and would need extending for
+        other locales.
+\end{itemize}
+
+% ------------------------------------------------------------------ 7
+\section*{7. Conclusion}
+
+The system uses \textbf{Qwen3-VL-4B-Instruct} served locally via
+\textbf{Ollama} as its default OCR engine, chosen for its multilingual
+performance (notably Arabic), its handling of documents, tables and
+handwriting, and --- critically --- the fact that it runs \textbf{fully offline
+on a 6\,GB laptop GPU}. The 4B size was selected over the 8B after direct
+measurement. A Groq / Llama 4 Scout cloud engine is retained behind the same
+abstraction as a higher-capacity alternative and as a benchmark. Around that
+engine the project delivers a complete chain --- preprocessing, page-by-page
+PDF handling, structured Markdown output, three quality-control tools and a
+multi-user web platform --- built to make human review short, not unnecessary.
+
+\end{document}
